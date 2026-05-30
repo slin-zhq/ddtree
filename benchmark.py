@@ -27,6 +27,9 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--flash-attn", action="store_true")
     parser.add_argument("--disable-cpp-compact-cache", action="store_true")
+    parser.add_argument("--entropy-tree", action="store_true", default=False)
+    parser.add_argument("--draft-temperature", type=float, default=1.0)
+    parser.add_argument("--log-entropy", action="store_true", default=False)
     parser.add_argument("--save-path", type=str, default=None)
     args = parser.parse_args()
 
@@ -76,9 +79,15 @@ def main() -> None:
     methods_to_run = ["dflash"]
     method_key_to_tree_budget = {}
     if not args.flash_attn:
-        ddtree_method_keys = [f"ddtree_tb{tree_budget}" for tree_budget in tree_budgets]
+        if args.entropy_tree:
+            ddtree_method_keys = [f"ddtree_entropy_tb{b}" for b in tree_budgets]
+        elif args.draft_temperature != 1.0:
+            temp_str = f"{args.draft_temperature:.1f}".replace(".", "p")
+            ddtree_method_keys = [f"ddtree_temp{temp_str}_tb{b}" for b in tree_budgets]
+        else:
+            ddtree_method_keys = [f"ddtree_tb{b}" for b in tree_budgets]
         methods_to_run.extend(ddtree_method_keys)
-        method_key_to_tree_budget.update({f"ddtree_tb{tree_budget}": tree_budget for tree_budget in tree_budgets})
+        method_key_to_tree_budget.update(dict(zip(ddtree_method_keys, tree_budgets)))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     dataset = load_and_process_dataset(args.dataset)
@@ -128,6 +137,8 @@ def main() -> None:
                 tree_budget=method_key_to_tree_budget[method_key],
                 stop_token_ids=[tokenizer.eos_token_id],
                 temperature=args.temperature,
+                entropy_tree=args.entropy_tree,
+                draft_temperature=args.draft_temperature,
             )
 
     responses = []
@@ -179,6 +190,9 @@ def main() -> None:
                         tree_budget=method_key_to_tree_budget[method_key],
                         stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature,
+                        entropy_tree=args.entropy_tree,
+                        draft_temperature=args.draft_temperature,
+                        log_entropy=args.log_entropy,
                     )
 
             spec_response = response[methods_to_run[-1]]
@@ -205,6 +219,21 @@ def main() -> None:
         save_path = Path(args.save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(run_data, save_path)
+
+    if args.log_entropy and args.save_path is not None:
+        import csv
+        ddtree_method = next((m for m in methods_to_run if m.startswith("ddtree_")), None)
+        if ddtree_method is not None:
+            entropy_save_path = Path(args.save_path).with_suffix(".entropy.csv")
+            with open(entropy_save_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["sample_idx", "round_idx", "depth_idx", "H_j", "log_P_star_j"])
+                for sample_idx, resp in enumerate(responses):
+                    if ddtree_method in resp and resp[ddtree_method].entropy_logs is not None:
+                        for round_idx, round_log in enumerate(resp[ddtree_method].entropy_logs):
+                            for depth_idx, (h, lp) in enumerate(zip(round_log["H_j"], round_log["log_P_star_j"])):
+                                writer.writerow([sample_idx, round_idx, depth_idx, h, lp])
+            logger.info(f"Entropy log saved to {entropy_save_path}")
 
 
 if __name__ == "__main__":

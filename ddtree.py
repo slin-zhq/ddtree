@@ -81,9 +81,28 @@ def maybe_enable_cpp_compact(enabled: bool) -> None:
         load_cpp_compact_module()
 
 
+def compute_branching_factors(entropies: np.ndarray, budget: int, b_max: int | None = None) -> np.ndarray:
+    total_H = entropies.sum()
+    if total_H == 0:
+        return np.ones(len(entropies), dtype=int)
+    raw = budget * entropies / total_H
+    b = np.maximum(1, np.round(raw).astype(int))
+    if b_max is not None:
+        b = np.minimum(b, b_max)
+    diff = int(budget - b.sum())
+    fracs = raw - np.floor(raw)
+    for _ in range(abs(diff)):
+        idx = int(np.argmax(fracs) if diff > 0 else np.argmin(fracs))
+        b[idx] += 1 if diff > 0 else -1
+        fracs[idx] = -np.inf if diff > 0 else np.inf
+    return b
+
+
 def build_ddtree_tree(
     draft_logits: torch.Tensor,
     budget: int,
+    entropy_tree: bool = False,
+    draft_temperature: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float]]:
     build_subtimes = empty_stage_times(DDTREE_TREE_BUILD_STAGE_ORDER)
 
@@ -99,11 +118,23 @@ def build_ddtree_tree(
             build_subtimes,
         )
 
-    topk = min(budget, draft_logits.shape[-1])
     depth_limit = int(draft_logits.shape[0])
 
     copy_start = cuda_time()
     logits = draft_logits.float()
+    if draft_temperature != 1.0:
+        logits = logits / draft_temperature
+    if entropy_tree:
+        probs_for_entropy = torch.softmax(logits, dim=-1)
+        entropies_np = (
+            -(probs_for_entropy * torch.log(probs_for_entropy + 1e-9))
+            .sum(dim=-1).to(device="cpu", dtype=torch.float32).numpy()
+        )
+        b = compute_branching_factors(entropies_np, budget, b_max=budget)
+        topk = min(int(b.max()), logits.shape[-1])
+    else:
+        b = None
+        topk = min(budget, logits.shape[-1])
     top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
     log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
     top_log_probs_cpu = (top_logits - log_z).to(device="cpu", dtype=torch.float32)
@@ -136,7 +167,7 @@ def build_ddtree_tree(
         child_maps[parent_index][token_id] = current_index
         node_count += 1
 
-        if rank + 1 < topk:
+        if rank + 1 < (int(b[depth - 1]) if entropy_tree else topk):
             sibling_ranks = ranks[:-1] + (rank + 1,)
             sibling_logw = logw - float(top_log_probs_np[depth - 1, rank]) + float(top_log_probs_np[depth - 1, rank + 1])
             heapq.heappush(heap, (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1, sibling_logw))
@@ -289,6 +320,9 @@ def ddtree_generate(
     temperature: float = 0.0,
     tree_budget: int | None = None,
     save_tree_traces: bool = False,
+    entropy_tree: bool = False,
+    draft_temperature: float = 1.0,
+    log_entropy: bool = False,
 ) -> SimpleNamespace:
     if block_size <= 1:
         return dflash_generate(
@@ -352,6 +386,7 @@ def ddtree_generate(
     acceptance_lengths = []
     round_timestamps = []
     round_trees = [] if save_tree_traces else None
+    round_entropy_logs = [] if log_entropy else None
     draft_prefill = True
     previous_tree_start = 0
     previous_tree_length = 0
@@ -378,9 +413,16 @@ def ddtree_generate(
         else:
             stage_times["draft"] += draft_stage_elapsed
 
+        if log_entropy:
+            _lf = draft_logits[0].float()
+            _probs = torch.softmax(_lf, dim=-1)
+            _H_j = (-(_probs * torch.log(_probs + 1e-9)).sum(dim=-1)).to("cpu").tolist()
+            _lp = torch.log(_probs.max(dim=-1).values + 1e-9).to("cpu").tolist()
+            round_entropy_logs.append({"H_j": _H_j, "log_P_star_j": _lp})
+
         tree_build_start = cuda_time()
         node_token_ids, node_depths, parents, child_maps, visibility_cpu, tree_build_subtimes = build_ddtree_tree(
-            draft_logits[0], tree_budget
+            draft_logits[0], tree_budget, entropy_tree=entropy_tree, draft_temperature=draft_temperature
         )
         stage_times["tree_build"] += cuda_time() - tree_build_start
         for stage_name, stage_elapsed in tree_build_subtimes.items():
@@ -469,4 +511,5 @@ def ddtree_generate(
         stage_times=stage_times,
         round_timestamps=round_timestamps,
         round_trees=round_trees,
+        entropy_logs=round_entropy_logs,
     )
