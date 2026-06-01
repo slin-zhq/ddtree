@@ -62,17 +62,40 @@ def main() -> None:
     if not args.flash_attn and installed_flash_attn:
         logger.warning("DDTree uses a custom tree attention mask on the target model. For compatibility, forcing the target verifier to torch.sdpa.")
 
-    target = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        attn_implementation=target_attn_implementation,
-        dtype=torch.bfloat16,
-    ).to(device).eval()
-
-    draft_model = DFlashDraftModel.from_pretrained(
-        args.draft_name_or_path,
-        attn_implementation=draft_attn_implementation,
-        dtype=torch.bfloat16,
-    ).to(device).eval()
+    # Single-process path: split both models across all available GPUs via device_map="auto".
+    # This handles GPU memory constraints where a single GPU can't hold both models (e.g. 2×16GB
+    # GPUs with two 8B models). Each model gets ~half the memory per GPU, leaving headroom for
+    # KV cache and activations.
+    # Multi-process path (data-parallel): each rank loads the full models onto its own GPU.
+    _use_model_parallel = dist.size() == 1 and torch.cuda.device_count() > 1
+    if _use_model_parallel:
+        n_gpus = torch.cuda.device_count()
+        # Reserve ~7.2 GiB per GPU for the target model; draft uses whatever remains.
+        _target_max_mem = {i: "7200MiB" for i in range(n_gpus)}
+        target = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            attn_implementation=target_attn_implementation,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            max_memory=_target_max_mem,
+        ).eval()
+        draft_model = DFlashDraftModel.from_pretrained(
+            args.draft_name_or_path,
+            attn_implementation=draft_attn_implementation,
+            dtype=torch.bfloat16,
+            device_map="auto",
+        ).eval()
+    else:
+        target = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            attn_implementation=target_attn_implementation,
+            dtype=torch.bfloat16,
+        ).to(device).eval()
+        draft_model = DFlashDraftModel.from_pretrained(
+            args.draft_name_or_path,
+            attn_implementation=draft_attn_implementation,
+            dtype=torch.bfloat16,
+        ).to(device).eval()
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
     tree_budgets = [int(tree_budget) for tree_budget in args.tree_budget.split(",")]
