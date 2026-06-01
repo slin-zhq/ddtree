@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--tree-budget", type=str, default="16,32,64,128,256,512,1024")
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--sample-seed", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--flash-attn", action="store_true")
@@ -116,7 +117,7 @@ def main() -> None:
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
-        dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
+        dataset = dataset.shuffle(seed=args.sample_seed if args.sample_seed is not None else 0).select(range(args.max_samples))
 
     warmup_input_text = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Warmup"}],
