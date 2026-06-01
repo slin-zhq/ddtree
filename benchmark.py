@@ -1,4 +1,5 @@
 import argparse
+import csv as _csv
 import random
 from itertools import chain
 from pathlib import Path
@@ -28,9 +29,19 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--flash-attn", action="store_true")
     parser.add_argument("--disable-cpp-compact-cache", action="store_true")
-    parser.add_argument("--entropy-tree", action="store_true", default=False)
     parser.add_argument("--draft-temperature", type=float, default=1.0)
-    parser.add_argument("--log-entropy", action="store_true", default=False)
+    # PairCondTree flags
+    parser.add_argument("--clamp-pivot", action="store_true",
+        help="Run a second DFlash pass per block with the pivot token clamped to argmax. "
+             "Enables gate diagnostic CSV output when combined with --log-paircondtree.")
+    parser.add_argument("--log-paircondtree", action="store_true",
+        help="Collect per-block conditional update metrics (Gates A–E) and save to .paircondtree.csv.")
+    parser.add_argument("--paircondtree", action="store_true",
+        help="Use branch-aware PairCondTree scoring (cond logits for v* subtree).")
+    parser.add_argument("--optional-pass", action="store_true",
+        help="Only run the second DFlash pass when the optional gate fires (~25%% of blocks).")
+    parser.add_argument("--random-pivot", action="store_true",
+        help="Clamp a random token as pivot (control baseline; use with --paircondtree).")
     parser.add_argument("--save-path", type=str, default=None)
     args = parser.parse_args()
 
@@ -102,9 +113,16 @@ def main() -> None:
     tree_budgets = [int(tree_budget) for tree_budget in args.tree_budget.split(",")]
     methods_to_run = ["dflash"]
     method_key_to_tree_budget = {}
+
     if not args.flash_attn:
-        if args.entropy_tree:
-            ddtree_method_keys = [f"ddtree_entropy_tb{b}" for b in tree_budgets]
+        if args.paircondtree and args.random_pivot:
+            ddtree_method_keys = [f"ddtree_randpivot_tb{b}" for b in tree_budgets]
+        elif args.paircondtree and args.optional_pass:
+            ddtree_method_keys = [f"ddtree_pct_opt_tb{b}" for b in tree_budgets]
+        elif args.paircondtree:
+            ddtree_method_keys = [f"ddtree_pct_tb{b}" for b in tree_budgets]
+        elif args.clamp_pivot:
+            ddtree_method_keys = [f"ddtree_clamp_tb{b}" for b in tree_budgets]
         elif args.draft_temperature != 1.0:
             temp_str = f"{args.draft_temperature:.1f}".replace(".", "p")
             ddtree_method_keys = [f"ddtree_temp{temp_str}_tb{b}" for b in tree_budgets]
@@ -161,8 +179,11 @@ def main() -> None:
                 tree_budget=method_key_to_tree_budget[method_key],
                 stop_token_ids=[tokenizer.eos_token_id],
                 temperature=args.temperature,
-                entropy_tree=args.entropy_tree,
                 draft_temperature=args.draft_temperature,
+                clamp_pivot=args.clamp_pivot,
+                paircondtree=args.paircondtree,
+                optional_pass=args.optional_pass,
+                random_pivot=args.random_pivot,
             )
 
     responses = []
@@ -214,9 +235,12 @@ def main() -> None:
                         tree_budget=method_key_to_tree_budget[method_key],
                         stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature,
-                        entropy_tree=args.entropy_tree,
                         draft_temperature=args.draft_temperature,
-                        log_entropy=args.log_entropy,
+                        clamp_pivot=args.clamp_pivot,
+                        log_paircondtree=args.log_paircondtree,
+                        paircondtree=args.paircondtree,
+                        optional_pass=args.optional_pass,
+                        random_pivot=args.random_pivot,
                     )
 
             spec_response = response[methods_to_run[-1]]
@@ -238,26 +262,30 @@ def main() -> None:
         "target_attn_implementation": target_attn_implementation,
         "args": vars(args),
     }
-    
+
     if args.save_path is not None:
         save_path = Path(args.save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(run_data, save_path)
 
-    if args.log_entropy and args.save_path is not None:
-        import csv
-        ddtree_method = next((m for m in methods_to_run if m.startswith("ddtree_")), None)
-        if ddtree_method is not None:
-            entropy_save_path = Path(args.save_path).with_suffix(".entropy.csv")
-            with open(entropy_save_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["sample_idx", "round_idx", "depth_idx", "H_j", "log_P_star_j"])
+    if args.log_paircondtree and args.save_path is not None:
+        pc_method = next((m for m in methods_to_run if m.startswith("ddtree_")), None)
+        if pc_method is not None:
+            csv_path = Path(args.save_path).with_suffix(".paircondtree.csv")
+            fieldnames = [
+                "prompt_id", "block_id", "pos_j",
+                "q_entropy_j", "q_logprob_target_j",
+                "q_prime_entropy_j", "q_prime_logprob_target_j",
+                "delta_j", "pivot_accepted",
+            ]
+            with open(csv_path, "w", newline="") as f:
+                writer = _csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
                 for sample_idx, resp in enumerate(responses):
-                    if ddtree_method in resp and resp[ddtree_method].entropy_logs is not None:
-                        for round_idx, round_log in enumerate(resp[ddtree_method].entropy_logs):
-                            for depth_idx, (h, lp) in enumerate(zip(round_log["H_j"], round_log["log_P_star_j"])):
-                                writer.writerow([sample_idx, round_idx, depth_idx, h, lp])
-            logger.info(f"Entropy log saved to {entropy_save_path}")
+                    if pc_method in resp and resp[pc_method].paircondtree_logs is not None:
+                        for entry in resp[pc_method].paircondtree_logs:
+                            writer.writerow({"prompt_id": sample_idx, **entry})
+            logger.info(f"PairCondTree log saved to {csv_path}")
 
 
 if __name__ == "__main__":

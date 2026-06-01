@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from loguru import logger
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, DynamicCache
 
 from model import DFlashDraftModel, sample, extract_context_feature
@@ -81,29 +82,36 @@ def maybe_enable_cpp_compact(enabled: bool) -> None:
         load_cpp_compact_module()
 
 
-def compute_branching_factors(entropies: np.ndarray, budget: int, b_max: int | None = None) -> np.ndarray:
-    total_H = entropies.sum()
-    if total_H == 0:
-        return np.ones(len(entropies), dtype=int)
-    raw = budget * entropies / total_H
-    b = np.maximum(1, np.round(raw).astype(int))
-    if b_max is not None:
-        b = np.minimum(b, b_max)
-    diff = int(budget - b.sum())
-    fracs = raw - np.floor(raw)
-    for _ in range(abs(diff)):
-        idx = int(np.argmax(fracs) if diff > 0 else np.argmin(fracs))
-        b[idx] += 1 if diff > 0 else -1
-        fracs[idx] = -np.inf if diff > 0 else np.inf
-    return b
+# ── PairCondTree helpers ───────────────────────────────────────────────────────
 
+def kl_div_from_logits(q_prime_logits: torch.Tensor, q_logits: torch.Tensor) -> float:
+    """KL(q' || q) in nats from raw logits [vocab_size]."""
+    q_prime = F.softmax(q_prime_logits.float(), dim=-1)
+    log_q = F.log_softmax(q_logits.float(), dim=-1)
+    return float(F.kl_div(log_q, q_prime, reduction="sum").item())
+
+
+def entropy_from_logits(logits: torch.Tensor) -> float:
+    """Shannon entropy H(P) in nats from raw logits [vocab_size]."""
+    p = F.softmax(logits.float(), dim=-1)
+    return float(-(p * p.log().clamp(min=-1e9)).sum().item())
+
+
+# ── Tree building ─────────────────────────────────────────────────────────────
 
 def build_ddtree_tree(
     draft_logits: torch.Tensor,
     budget: int,
-    entropy_tree: bool = False,
     draft_temperature: float = 1.0,
+    cond_logits: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float]]:
+    """
+    Build the DDTree draft tree.
+
+    cond_logits: [depth_limit, vocab_size] conditional logits from the second DFlash pass
+                 (pivot clamped to v*=argmax). When provided, paths starting with v* use
+                 cond_logits for scoring at depth >= 2 (branch-aware PairCondTree scorer).
+    """
     build_subtimes = empty_stage_times(DDTREE_TREE_BUILD_STAGE_ORDER)
 
     if budget <= 0 or draft_logits.shape[0] == 0:
@@ -124,25 +132,28 @@ def build_ddtree_tree(
     logits = draft_logits.float()
     if draft_temperature != 1.0:
         logits = logits / draft_temperature
-    if entropy_tree:
-        probs_for_entropy = torch.softmax(logits, dim=-1)
-        entropies_np = (
-            -(probs_for_entropy * torch.log(probs_for_entropy + 1e-9))
-            .sum(dim=-1).to(device="cpu", dtype=torch.float32).numpy()
-        )
-        b = compute_branching_factors(entropies_np, budget, b_max=budget)
-        topk = min(int(b.max()), logits.shape[-1])
-    else:
-        b = None
-        topk = min(budget, logits.shape[-1])
+    topk = min(budget, logits.shape[-1])
     top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
     log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
     top_log_probs_cpu = (top_logits - log_z).to(device="cpu", dtype=torch.float32)
     top_token_ids_cpu = top_token_ids.to(device="cpu", dtype=torch.long)
-    build_subtimes["tree_build_copy"] = cuda_time() - copy_start
+
+    # Conditional top-k for the v_star branch (depth >= 2).
+    # v_star = argmax at depth 1 = rank 0; detected in the heap by ranks[0] == 0.
+    top_log_probs_cond_np = None
+    top_token_ids_cond_np = None
+    if cond_logits is not None:
+        cond_f = cond_logits.float()
+        if draft_temperature != 1.0:
+            cond_f = cond_f / draft_temperature
+        top_cond, top_ids_cond = torch.topk(cond_f, k=topk, dim=-1)
+        log_z_cond = torch.logsumexp(cond_f, dim=-1, keepdim=True)
+        top_log_probs_cond_np = (top_cond - log_z_cond).to(device="cpu", dtype=torch.float32).numpy()
+        top_token_ids_cond_np = top_ids_cond.to(device="cpu", dtype=torch.long).numpy()
 
     top_log_probs_np = top_log_probs_cpu.numpy()
     top_token_ids_np = top_token_ids_cpu.numpy()
+    build_subtimes["tree_build_copy"] = cuda_time() - copy_start
 
     heap_start = time.perf_counter()
     first_logw = float(top_log_probs_np[0, 0])
@@ -158,7 +169,17 @@ def build_ddtree_tree(
     while heap and node_count < budget:
         _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
 
-        token_id = int(top_token_ids_np[depth - 1, rank])
+        # Use conditional top-k when on the v_star branch (ranks[0]==0) at depth >= 2.
+        use_cond = (
+            top_log_probs_cond_np is not None
+            and len(ranks) > 0
+            and ranks[0] == 0
+            and depth > 1
+        )
+        lp_arr = top_log_probs_cond_np if use_cond else top_log_probs_np
+        tok_arr = top_token_ids_cond_np if use_cond else top_token_ids_np
+
+        token_id = int(tok_arr[depth - 1, rank])
         current_index = node_count + 1
         node_token_ids_np[node_count] = token_id
         node_depths_np[node_count] = depth
@@ -167,14 +188,26 @@ def build_ddtree_tree(
         child_maps[parent_index][token_id] = current_index
         node_count += 1
 
-        if rank + 1 < (int(b[depth - 1]) if entropy_tree else topk):
+        # Sibling at same depth (same branch).
+        if rank + 1 < topk:
             sibling_ranks = ranks[:-1] + (rank + 1,)
-            sibling_logw = logw - float(top_log_probs_np[depth - 1, rank]) + float(top_log_probs_np[depth - 1, rank + 1])
+            sibling_logw = (
+                logw
+                - float(lp_arr[depth - 1, rank])
+                + float(lp_arr[depth - 1, rank + 1])
+            )
             heapq.heappush(heap, (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1, sibling_logw))
 
+        # Child at depth + 1.
         if depth < depth_limit:
             child_ranks = ranks + (0,)
-            child_logw = logw + float(top_log_probs_np[depth, 0])
+            # Child inherits the v_star branch if: current node IS v_star (depth==1, rank==0)
+            # or current node is already on the v_star branch.
+            child_on_vstar = top_log_probs_cond_np is not None and (
+                (depth == 1 and rank == 0) or use_cond
+            )
+            child_lp = top_log_probs_cond_np if child_on_vstar else top_log_probs_np
+            child_logw = logw + float(child_lp[depth, 0])
             heapq.heappush(heap, (-child_logw, child_ranks, current_index, depth + 1, 0, child_logw))
 
     build_subtimes["tree_build_heap"] = time.perf_counter() - heap_start
@@ -320,9 +353,13 @@ def ddtree_generate(
     temperature: float = 0.0,
     tree_budget: int | None = None,
     save_tree_traces: bool = False,
-    entropy_tree: bool = False,
     draft_temperature: float = 1.0,
-    log_entropy: bool = False,
+    # PairCondTree flags
+    clamp_pivot: bool = False,       # run 2nd DFlash pass; enables log_paircondtree CSV data
+    log_paircondtree: bool = False,  # collect per-round gate metrics (returned in paircondtree_logs)
+    paircondtree: bool = False,      # use branch-aware conditional tree scoring
+    optional_pass: bool = False,     # only run 2nd pass when optional gate fires
+    random_pivot: bool = False,      # clamp a random token instead of argmax (control)
 ) -> SimpleNamespace:
     if block_size <= 1:
         return dflash_generate(
@@ -386,15 +423,19 @@ def ddtree_generate(
     acceptance_lengths = []
     round_timestamps = []
     round_trees = [] if save_tree_traces else None
-    round_entropy_logs = [] if log_entropy else None
+    paircondtree_logs = [] if (log_paircondtree or clamp_pivot) else None
     draft_prefill = True
     previous_tree_start = 0
     previous_tree_length = 0
+    round_idx = 0
+
+    need_second_pass = clamp_pivot or paircondtree
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
         root_token = block_output_ids[:, :1]
 
+        # ── Draft pass 1 (marginal) ────────────────────────────────────────────
         draft_stage_start = cuda_time()
         noise_embedding = target.model.embed_tokens(block_output_ids)
         draft_logits = target.lm_head(model(
@@ -413,16 +454,47 @@ def ddtree_generate(
         else:
             stage_times["draft"] += draft_stage_elapsed
 
-        if log_entropy:
-            _lf = draft_logits[0].float()
-            _probs = torch.softmax(_lf, dim=-1)
-            _H_j = (-(_probs * torch.log(_probs + 1e-9)).sum(dim=-1)).to("cpu").tolist()
-            _lp = torch.log(_probs.max(dim=-1).values + 1e-9).to("cpu").tolist()
-            round_entropy_logs.append({"H_j": _H_j, "log_P_star_j": _lp})
+        # ── Draft pass 2 (clamped pivot, PairCondTree) ─────────────────────────
+        v_star_tok = None
+        cond_draft_logits = None
+        if need_second_pass:
+            v_star_tok = int(draft_logits[0, 0, :].argmax().item())
+            if random_pivot:
+                v_star_tok = int(torch.randint(draft_logits.shape[-1], (1,), device=draft_logits.device).item())
+
+            run_second = True
+            if optional_pass:
+                pivot_max_prob = float(torch.softmax(draft_logits[0, 0].float(), dim=-1).max().item())
+                suffix_ents = [entropy_from_logits(draft_logits[0, j]) for j in range(1, draft_horizon)]
+                mean_suffix_ent = sum(suffix_ents) / len(suffix_ents) if suffix_ents else 0.0
+                run_second = pivot_max_prob > 0.5 and mean_suffix_ent > 0.8
+
+            if run_second:
+                draft_second_start = cuda_time()
+                clamped_block_ids = block_output_ids.clone()
+                clamped_block_ids[0, 1] = v_star_tok  # position 1 = first draft slot = pivot
+                clamped_noise_emb = target.model.embed_tokens(clamped_block_ids)
+                cond_draft_logits = target.lm_head(model(
+                    target_hidden=target_hidden,
+                    noise_embedding=clamped_noise_emb,
+                    position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],
+                    past_key_values=past_key_values_draft,
+                    use_cache=True,
+                    is_causal=False,
+                )[:, -draft_horizon:, :])
+                past_key_values_draft.crop(start)
+                stage_times["draft"] += cuda_time() - draft_second_start  # counted in draft time
+
+        # ── Tree build ──────────────────────────────────────────────────────────
+        # Pass cond_logits[0] (shape [depth_limit, vocab]) only when running full
+        # PairCondTree (not just for gate diagnostics via clamp_pivot alone).
+        cond_for_tree = cond_draft_logits[0] if (paircondtree and cond_draft_logits is not None) else None
 
         tree_build_start = cuda_time()
         node_token_ids, node_depths, parents, child_maps, visibility_cpu, tree_build_subtimes = build_ddtree_tree(
-            draft_logits[0], tree_budget, entropy_tree=entropy_tree, draft_temperature=draft_temperature
+            draft_logits[0], tree_budget,
+            draft_temperature=draft_temperature,
+            cond_logits=cond_for_tree,
         )
         stage_times["tree_build"] += cuda_time() - tree_build_start
         for stage_name, stage_elapsed in tree_build_subtimes.items():
@@ -474,6 +546,44 @@ def ddtree_generate(
         start += len(accepted_indices)
         stage_times["commit"] += cuda_time() - commit_stage_start
         round_timestamps.append(cuda_time() - round_clock_start)
+
+        # ── PairCondTree gate logging ───────────────────────────────────────────
+        if paircondtree_logs is not None and cond_draft_logits is not None:
+            posterior_tokens = posterior[0].tolist()
+            y_target_tok = int(posterior_tokens[0])   # target's preferred token at depth 1
+            pivot_accepted = int(y_target_tok == v_star_tok)
+
+            # pos_j=0: pivot row (delta=0, used only for Gate E pivot-acceptance rate)
+            q0 = draft_logits[0, 0]
+            lsm0 = F.log_softmax(q0.float(), dim=-1)
+            paircondtree_logs.append({
+                "block_id": round_idx,
+                "pos_j": 0,
+                "q_entropy_j": entropy_from_logits(q0),
+                "q_logprob_target_j": float(lsm0[y_target_tok].item()),
+                "q_prime_entropy_j": 0.0,
+                "q_prime_logprob_target_j": 0.0,
+                "delta_j": 0.0,
+                "pivot_accepted": pivot_accepted,
+            })
+
+            # pos_j=1..K-1: conditional update metrics
+            for j in range(1, draft_horizon):
+                q_j = draft_logits[0, j]
+                qp_j = cond_draft_logits[0, j]
+                lsm_j = F.log_softmax(q_j.float(), dim=-1)
+                lsm_pj = F.log_softmax(qp_j.float(), dim=-1)
+                paircondtree_logs.append({
+                    "block_id": round_idx,
+                    "pos_j": j,
+                    "q_entropy_j": entropy_from_logits(q_j),
+                    "q_logprob_target_j": float(lsm_j[y_target_tok].item()),
+                    "q_prime_entropy_j": entropy_from_logits(qp_j),
+                    "q_prime_logprob_target_j": float(lsm_pj[y_target_tok].item()),
+                    "delta_j": kl_div_from_logits(qp_j, q_j),
+                    "pivot_accepted": pivot_accepted,
+                })
+
         if save_tree_traces:
             round_trees.append({
                 "accepted_indices": [int(index) for index in accepted_indices],
@@ -488,6 +598,8 @@ def ddtree_generate(
             new_tokens = output_ids[:, start - len(accepted_indices) : start + 1]
             if torch.isin(new_tokens[0], stop_token_ids_tensor).any():
                 break
+
+        round_idx += 1
 
     output_ids = output_ids[:, :max_length]
     output_ids = output_ids[:, output_ids[0] != mask_token_id]
@@ -511,5 +623,5 @@ def ddtree_generate(
         stage_times=stage_times,
         round_timestamps=round_timestamps,
         round_trees=round_trees,
-        entropy_logs=round_entropy_logs,
+        paircondtree_logs=paircondtree_logs,
     )
