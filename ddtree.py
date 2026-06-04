@@ -471,13 +471,18 @@ def ddtree_generate(
 
             if run_second:
                 draft_second_start = cuda_time()
+                # Restore cache to pre-first-pass state so position_ids covers
+                # the full (target_hidden + noise) range, matching k's length in
+                # apply_rotary_pos_emb (k = cat[k_ctx, k_noise], len = ctx + block_size).
+                ctx_start = start - target_hidden.shape[1]
+                past_key_values_draft.crop(ctx_start)
                 clamped_block_ids = block_output_ids.clone()
                 clamped_block_ids[0, 1] = v_star_tok  # position 1 = first draft slot = pivot
                 clamped_noise_emb = target.model.embed_tokens(clamped_block_ids)
                 cond_draft_logits = target.lm_head(model(
                     target_hidden=target_hidden,
                     noise_embedding=clamped_noise_emb,
-                    position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],
+                    position_ids=position_ids[:, ctx_start : start + block_size],
                     past_key_values=past_key_values_draft,
                     use_cache=True,
                     is_causal=False,
