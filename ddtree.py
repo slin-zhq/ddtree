@@ -230,6 +230,130 @@ def build_ddtree_tree(
     return node_token_ids, node_depths, parents, child_maps, visibility, build_subtimes
 
 
+def sample_jtv2_paths(draft_logits: torch.Tensor, K: int, temperature: float) -> list[torch.Tensor]:
+    """Sample K independent full-depth paths from per-position draft logits."""
+    depth_limit = int(draft_logits.shape[0])
+    if K <= 0 or depth_limit == 0:
+        return []
+
+    if temperature <= 0.0:
+        greedy = draft_logits.argmax(dim=-1).to(device="cpu", dtype=torch.long)
+        return [greedy.clone() for _ in range(K)]
+
+    probs = torch.softmax(draft_logits.float() / temperature, dim=-1)
+    samples = torch.multinomial(probs, num_samples=K, replacement=True).T
+    return [samples[k].to(device="cpu", dtype=torch.long) for k in range(K)]
+
+
+def build_jtv2_trie(
+    draft_logits: torch.Tensor,
+    paths: list[torch.Tensor] | torch.Tensor,
+    budget: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float]]:
+    """Build a JointTree-v2 trie from sampled paths, scored by greedy log-probs."""
+    build_subtimes = empty_stage_times(DDTREE_TREE_BUILD_STAGE_ORDER)
+
+    depth_limit = int(draft_logits.shape[0])
+    if isinstance(paths, torch.Tensor):
+        path_list = [paths[k].to(device="cpu", dtype=torch.long) for k in range(int(paths.shape[0]))]
+    else:
+        path_list = [path.to(device="cpu", dtype=torch.long) for path in paths]
+
+    if budget is None:
+        budget = len(path_list) * depth_limit
+    budget = max(int(budget), 0)
+
+    if budget <= 0 or depth_limit == 0 or len(path_list) == 0:
+        visibility = torch.zeros((1, 1), dtype=torch.bool)
+        visibility[0, 0] = True
+        return (
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+            [-1],
+            [dict()],
+            visibility,
+            build_subtimes,
+        )
+
+    copy_start = cuda_time()
+    log_probs_cpu = F.log_softmax(draft_logits.float(), dim=-1).to(device="cpu", dtype=torch.float32)
+    build_subtimes["tree_build_copy"] = cuda_time() - copy_start
+
+    heap_start = time.perf_counter()
+    full_node_token_ids: list[int] = []
+    full_node_depths: list[int] = []
+    full_node_scores: list[float] = [0.0]
+    full_parents: list[int] = [-1]
+    full_child_maps: list[dict[int, int]] = [dict()]
+
+    for path in path_list:
+        current_index = 0
+        score = 0.0
+        max_depth = min(depth_limit, int(path.numel()))
+        for pos in range(max_depth):
+            token_id = int(path[pos].item())
+            score += float(log_probs_cpu[pos, token_id].item())
+
+            child_index = full_child_maps[current_index].get(token_id)
+            if child_index is None:
+                child_index = len(full_parents)
+                full_child_maps[current_index][token_id] = child_index
+                full_child_maps.append(dict())
+                full_parents.append(current_index)
+                full_node_token_ids.append(token_id)
+                full_node_depths.append(pos + 1)
+                full_node_scores.append(score)
+
+            current_index = child_index
+
+    selected_old_indices = sorted(
+        range(1, len(full_parents)),
+        key=lambda idx: (-full_node_scores[idx], full_node_depths[idx - 1], idx),
+    )[:budget]
+
+    old_to_new = {0: 0}
+    parents: list[int] = [-1]
+    child_maps: list[dict[int, int]] = [dict()]
+    node_token_ids: list[int] = []
+    node_depths: list[int] = []
+
+    for old_index in selected_old_indices:
+        parent_old_index = full_parents[old_index]
+        if parent_old_index not in old_to_new:
+            # Ancestors have greater-or-equal prefix score and sort before children.
+            # This guard keeps the returned structure valid if scores tie unusually.
+            continue
+        new_index = len(parents)
+        old_to_new[old_index] = new_index
+        parent_new_index = old_to_new[parent_old_index]
+        token_id = full_node_token_ids[old_index - 1]
+        parents.append(parent_new_index)
+        child_maps.append(dict())
+        child_maps[parent_new_index][token_id] = new_index
+        node_token_ids.append(token_id)
+        node_depths.append(full_node_depths[old_index - 1])
+    build_subtimes["tree_build_heap"] = time.perf_counter() - heap_start
+
+    visibility_start = time.perf_counter()
+    current_length = len(parents)
+    visibility_np = np.zeros((current_length, current_length), dtype=np.bool_)
+    visibility_np[0, 0] = True
+    for index in range(1, current_length):
+        parent_index = int(parents[index])
+        visibility_np[index, :index] = visibility_np[parent_index, :index]
+        visibility_np[index, index] = True
+    build_subtimes["tree_build_visibility"] = time.perf_counter() - visibility_start
+
+    return (
+        torch.tensor(node_token_ids, dtype=torch.long),
+        torch.tensor(node_depths, dtype=torch.long),
+        parents,
+        child_maps,
+        torch.from_numpy(visibility_np),
+        build_subtimes,
+    )
+
+
 def compile_ddtree_tree(
     root_token_id: torch.Tensor,
     start: int,
@@ -360,6 +484,11 @@ def ddtree_generate(
     paircondtree: bool = False,      # use branch-aware conditional tree scoring
     optional_pass: bool = False,     # only run 2nd pass when optional gate fires
     random_pivot: bool = False,      # clamp a random token instead of argmax (control)
+    # JointTree-v2 flags
+    jtv2: bool = False,
+    jtv2_K: int = 3,
+    jtv2_temperature: float = 0.5,
+    jtv2_shuffle: bool = False,
 ) -> SimpleNamespace:
     if block_size <= 1:
         return dflash_generate(
@@ -376,7 +505,10 @@ def ddtree_generate(
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
     draft_horizon = block_size - 1
-    tree_budget = draft_horizon if tree_budget is None else max(tree_budget, 0)
+    if tree_budget is None:
+        tree_budget = jtv2_K * draft_horizon if jtv2 else draft_horizon
+    else:
+        tree_budget = max(tree_budget, 0)
     max_tree_nodes = 1 + tree_budget
 
     output_ids = torch.full(
@@ -496,11 +628,23 @@ def ddtree_generate(
         cond_for_tree = cond_draft_logits[0] if (paircondtree and cond_draft_logits is not None) else None
 
         tree_build_start = cuda_time()
-        node_token_ids, node_depths, parents, child_maps, visibility_cpu, tree_build_subtimes = build_ddtree_tree(
-            draft_logits[0], tree_budget,
-            draft_temperature=draft_temperature,
-            cond_logits=cond_for_tree,
-        )
+        if jtv2:
+            paths = sample_jtv2_paths(draft_logits[0], jtv2_K, jtv2_temperature)
+            if jtv2_shuffle:
+                for path_idx, path in enumerate(paths):
+                    perm = torch.randperm(path.shape[0])
+                    paths[path_idx] = path[perm]
+            node_token_ids, node_depths, parents, child_maps, visibility_cpu, tree_build_subtimes = build_jtv2_trie(
+                draft_logits[0],
+                paths,
+                tree_budget,
+            )
+        else:
+            node_token_ids, node_depths, parents, child_maps, visibility_cpu, tree_build_subtimes = build_ddtree_tree(
+                draft_logits[0], tree_budget,
+                draft_temperature=draft_temperature,
+                cond_logits=cond_for_tree,
+            )
         stage_times["tree_build"] += cuda_time() - tree_build_start
         for stage_name, stage_elapsed in tree_build_subtimes.items():
             stage_times[stage_name] += stage_elapsed

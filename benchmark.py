@@ -42,6 +42,15 @@ def main() -> None:
         help="Only run the second DFlash pass when the optional gate fires (~25%% of blocks).")
     parser.add_argument("--random-pivot", action="store_true",
         help="Clamp a random token as pivot (control baseline; use with --paircondtree).")
+    # JointTree-v2 flags
+    parser.add_argument("--jtv2", action="store_true",
+        help="Use JointTree-v2 sampled-path trie construction instead of DDTree heap construction.")
+    parser.add_argument("--jtv2-K", type=int, default=3,
+        help="Number of sampled paths to merge into the JointTree-v2 trie.")
+    parser.add_argument("--jtv2-temperature", type=float, default=0.5,
+        help="Sampling temperature for JointTree-v2 paths.")
+    parser.add_argument("--jtv2-shuffle", action="store_true",
+        help="Shuffle each sampled JointTree-v2 path before merging (sequence-structure control).")
     parser.add_argument("--save-path", type=str, default=None)
     args = parser.parse_args()
 
@@ -115,7 +124,11 @@ def main() -> None:
     method_key_to_tree_budget = {}
 
     if not args.flash_attn:
-        if args.paircondtree and args.random_pivot:
+        if args.jtv2:
+            temp_str = f"{args.jtv2_temperature:g}".replace(".", "p")
+            shuffle_suffix = "_shuffle" if args.jtv2_shuffle else ""
+            ddtree_method_keys = [f"jtv2_K{args.jtv2_K}_T{temp_str}{shuffle_suffix}_tb{b}" for b in tree_budgets]
+        elif args.paircondtree and args.random_pivot:
             ddtree_method_keys = [f"ddtree_randpivot_tb{b}" for b in tree_budgets]
         elif args.paircondtree and args.optional_pass:
             ddtree_method_keys = [f"ddtree_pct_opt_tb{b}" for b in tree_budgets]
@@ -184,6 +197,10 @@ def main() -> None:
                 paircondtree=args.paircondtree,
                 optional_pass=args.optional_pass,
                 random_pivot=args.random_pivot,
+                jtv2=args.jtv2,
+                jtv2_K=args.jtv2_K,
+                jtv2_temperature=args.jtv2_temperature,
+                jtv2_shuffle=args.jtv2_shuffle,
             )
 
     responses = []
@@ -241,6 +258,10 @@ def main() -> None:
                         paircondtree=args.paircondtree,
                         optional_pass=args.optional_pass,
                         random_pivot=args.random_pivot,
+                        jtv2=args.jtv2,
+                        jtv2_K=args.jtv2_K,
+                        jtv2_temperature=args.jtv2_temperature,
+                        jtv2_shuffle=args.jtv2_shuffle,
                     )
 
             spec_response = response[methods_to_run[-1]]
