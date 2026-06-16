@@ -38,6 +38,13 @@ def main() -> None:
         help="Collect per-block conditional update metrics (Gates A–E) and save to .paircondtree.csv.")
     parser.add_argument("--paircondtree", action="store_true",
         help="Use branch-aware PairCondTree scoring (cond logits for v* subtree).")
+    parser.add_argument("--paircondtree-deep-only", action="store_true",
+        help="DeepOnly PairCondTree: apply conditional scoring only at deep positions "
+             "(pos_j >= --paircondtree-deep-start), keeping marginal q_j at shallow positions. "
+             "Requires --paircondtree.")
+    parser.add_argument("--paircondtree-deep-start", type=int, default=4,
+        help="Zero-indexed drafted-position floor J_DEEP for DeepOnly scoring (pos_j=0 is the "
+             "pivot). Only used with --paircondtree-deep-only. Default 4.")
     parser.add_argument("--optional-pass", action="store_true",
         help="Only run the second DFlash pass when the optional gate fires (~25%% of blocks).")
     parser.add_argument("--random-pivot", action="store_true",
@@ -128,12 +135,17 @@ def main() -> None:
             temp_str = f"{args.jtv2_temperature:g}".replace(".", "p")
             shuffle_suffix = "_shuffle" if args.jtv2_shuffle else ""
             ddtree_method_keys = [f"jtv2_K{args.jtv2_K}_T{temp_str}{shuffle_suffix}_tb{b}" for b in tree_budgets]
-        elif args.paircondtree and args.random_pivot:
-            ddtree_method_keys = [f"ddtree_randpivot_tb{b}" for b in tree_budgets]
-        elif args.paircondtree and args.optional_pass:
-            ddtree_method_keys = [f"ddtree_pct_opt_tb{b}" for b in tree_budgets]
         elif args.paircondtree:
-            ddtree_method_keys = [f"ddtree_pct_tb{b}" for b in tree_budgets]
+            # DeepOnly adds a _deep{N} suffix so deep4/deep5 outputs are distinguishable
+            # from full PairCondTree and from each other. Empty when deep-only is off, so
+            # the non-deep method keys are byte-identical to the previous behavior.
+            deep_suffix = f"_deep{args.paircondtree_deep_start}" if args.paircondtree_deep_only else ""
+            if args.random_pivot:
+                ddtree_method_keys = [f"ddtree_randpivot{deep_suffix}_tb{b}" for b in tree_budgets]
+            elif args.optional_pass:
+                ddtree_method_keys = [f"ddtree_pct_opt{deep_suffix}_tb{b}" for b in tree_budgets]
+            else:
+                ddtree_method_keys = [f"ddtree_pct{deep_suffix}_tb{b}" for b in tree_budgets]
         elif args.clamp_pivot:
             ddtree_method_keys = [f"ddtree_clamp_tb{b}" for b in tree_budgets]
         elif args.draft_temperature != 1.0:
@@ -195,6 +207,7 @@ def main() -> None:
                 draft_temperature=args.draft_temperature,
                 clamp_pivot=args.clamp_pivot,
                 paircondtree=args.paircondtree,
+                paircondtree_deep_start=(args.paircondtree_deep_start if args.paircondtree_deep_only else 1),
                 optional_pass=args.optional_pass,
                 random_pivot=args.random_pivot,
                 jtv2=args.jtv2,
@@ -256,6 +269,7 @@ def main() -> None:
                         clamp_pivot=args.clamp_pivot,
                         log_paircondtree=args.log_paircondtree,
                         paircondtree=args.paircondtree,
+                        paircondtree_deep_start=(args.paircondtree_deep_start if args.paircondtree_deep_only else 1),
                         optional_pass=args.optional_pass,
                         random_pivot=args.random_pivot,
                         jtv2=args.jtv2,

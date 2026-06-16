@@ -104,13 +104,20 @@ def build_ddtree_tree(
     budget: int,
     draft_temperature: float = 1.0,
     cond_logits: torch.Tensor | None = None,
+    deep_start: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float]]:
     """
     Build the DDTree draft tree.
 
     cond_logits: [depth_limit, vocab_size] conditional logits from the second DFlash pass
                  (pivot clamped to v*=argmax). When provided, paths starting with v* use
-                 cond_logits for scoring at depth >= 2 (branch-aware PairCondTree scorer).
+                 cond_logits for scoring (branch-aware PairCondTree scorer).
+    deep_start:  zero-indexed drafted-position floor at/after which cond_logits is applied
+                 on the v* branch. pos_j = depth - 1 (pos_j=0 is the pivot). deep_start=1
+                 reproduces full PairCondTree (cond at every position after the pivot);
+                 deep_start=4 is DeepOnly J_DEEP=4 (cond only at pos_j >= 4). v*-branch
+                 membership is tracked independently of whether cond is applied, so shallow
+                 v* nodes still propagate the branch to their deep children.
     """
     build_subtimes = empty_stage_times(DDTREE_TREE_BUILD_STAGE_ORDER)
 
@@ -169,13 +176,16 @@ def build_ddtree_tree(
     while heap and node_count < budget:
         _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
 
-        # Use conditional top-k when on the v_star branch (ranks[0]==0) at depth >= 2.
-        use_cond = (
+        # On the v_star branch iff the path's first token is the pivot (rank 0 at depth 1).
+        on_vstar_branch = (
             top_log_probs_cond_np is not None
             and len(ranks) > 0
             and ranks[0] == 0
-            and depth > 1
         )
+        # Apply the conditional distribution only at/after the deep-position floor:
+        # pos_j = depth - 1, so cond fires when (depth - 1) >= deep_start. deep_start=1
+        # reproduces full PairCondTree (cond at depth >= 2, i.e. pos_j >= 1).
+        use_cond = on_vstar_branch and (depth - 1) >= deep_start
         lp_arr = top_log_probs_cond_np if use_cond else top_log_probs_np
         tok_arr = top_token_ids_cond_np if use_cond else top_token_ids_np
 
@@ -201,12 +211,16 @@ def build_ddtree_tree(
         # Child at depth + 1.
         if depth < depth_limit:
             child_ranks = ranks + (0,)
-            # Child inherits the v_star branch if: current node IS v_star (depth==1, rank==0)
-            # or current node is already on the v_star branch.
-            child_on_vstar = top_log_probs_cond_np is not None and (
-                (depth == 1 and rank == 0) or use_cond
+            # Child is on the v_star branch if the current node IS the pivot (depth==1,
+            # rank==0) or the current node is already on the v_star branch. Tracked via
+            # on_vstar_branch (not use_cond) so shallow v_star nodes below deep_start still
+            # propagate the branch to their deep children.
+            child_on_vstar_branch = top_log_probs_cond_np is not None and (
+                (depth == 1 and rank == 0) or on_vstar_branch
             )
-            child_lp = top_log_probs_cond_np if child_on_vstar else top_log_probs_np
+            # Child sits at depth+1, i.e. pos_j = depth; apply cond only at/after deep_start.
+            child_use_cond = child_on_vstar_branch and depth >= deep_start
+            child_lp = top_log_probs_cond_np if child_use_cond else top_log_probs_np
             child_logw = logw + float(child_lp[depth, 0])
             heapq.heappush(heap, (-child_logw, child_ranks, current_index, depth + 1, 0, child_logw))
 
@@ -482,6 +496,7 @@ def ddtree_generate(
     clamp_pivot: bool = False,       # run 2nd DFlash pass; enables log_paircondtree CSV data
     log_paircondtree: bool = False,  # collect per-round gate metrics (returned in paircondtree_logs)
     paircondtree: bool = False,      # use branch-aware conditional tree scoring
+    paircondtree_deep_start: int = 1,  # DeepOnly floor: cond applied only at pos_j >= this (1 = full)
     optional_pass: bool = False,     # only run 2nd pass when optional gate fires
     random_pivot: bool = False,      # clamp a random token instead of argmax (control)
     # JointTree-v2 flags
@@ -644,6 +659,7 @@ def ddtree_generate(
                 draft_logits[0], tree_budget,
                 draft_temperature=draft_temperature,
                 cond_logits=cond_for_tree,
+                deep_start=paircondtree_deep_start,
             )
         stage_times["tree_build"] += cuda_time() - tree_build_start
         for stage_name, stage_elapsed in tree_build_subtimes.items():
