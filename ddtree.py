@@ -715,8 +715,23 @@ def ddtree_generate(
         # ── PairCondTree gate logging ───────────────────────────────────────────
         if paircondtree_logs is not None and cond_draft_logits is not None:
             posterior_tokens = posterior[0].tolist()
-            y_target_tok = int(posterior_tokens[0])   # target's preferred token at depth 1
+            y_target_tok = int(posterior_tokens[0])   # target's preferred at pos_j=0 (pivot)
             pivot_accepted = int(y_target_tok == v_star_tok)
+
+            # Resolve the target's preferred token at each draft position along the v★
+            # path. posterior_tokens[i] = target's next-token prediction at tree node i.
+            # Tree nodes are heap-ordered (node index j ≠ draft depth j), so we must
+            # traverse child_maps: root(0) → v★ child → target-preferred continuation.
+            # If the v★ path terminates before draft_horizon (tree budget ran out),
+            # positions beyond the last allocated node are set to None and logged as NaN.
+            target_tok_by_pos = [None] * draft_horizon
+            target_tok_by_pos[0] = y_target_tok
+            cur = child_maps[0].get(v_star_tok)
+            for _j in range(1, draft_horizon):
+                if cur is None:
+                    break
+                target_tok_by_pos[_j] = int(posterior_tokens[cur])
+                cur = child_maps[cur].get(target_tok_by_pos[_j])
 
             # pos_j=0: pivot row (delta=0, used only for Gate E pivot-acceptance rate)
             q0 = draft_logits[0, 0]
@@ -738,13 +753,14 @@ def ddtree_generate(
                 qp_j = cond_draft_logits[0, j]
                 lsm_j = F.log_softmax(q_j.float(), dim=-1)
                 lsm_pj = F.log_softmax(qp_j.float(), dim=-1)
+                y_j = target_tok_by_pos[j]
                 paircondtree_logs.append({
                     "block_id": round_idx,
                     "pos_j": j,
                     "q_entropy_j": entropy_from_logits(q_j),
-                    "q_logprob_target_j": float(lsm_j[y_target_tok].item()),
+                    "q_logprob_target_j": float("nan") if y_j is None else float(lsm_j[y_j].item()),
                     "q_prime_entropy_j": entropy_from_logits(qp_j),
-                    "q_prime_logprob_target_j": float(lsm_pj[y_target_tok].item()),
+                    "q_prime_logprob_target_j": float("nan") if y_j is None else float(lsm_pj[y_j].item()),
                     "delta_j": kl_div_from_logits(qp_j, q_j),
                     "pivot_accepted": pivot_accepted,
                 })
